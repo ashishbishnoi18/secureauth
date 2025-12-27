@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Check Your Email</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-slate-100 flex items-center justify-center">
+  <div class="w-full max-w-md mx-4">
+    <div class="bg-white rounded-2xl shadow-xl p-8">
+      <div class="flex justify-center mb-6">
+        <div class="h-12 w-12 rounded-full bg-blue-100 flex items-center justify-center">
+          <svg class="h-6 w-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+          </svg>
+        </div>
+      </div>
+
+      <h1 class="text-2xl font-semibold text-center text-slate-800 mb-2">
+        Check Your Email
+      </h1>
+      <p class="text-center text-slate-500 mb-6">
+        If an account exists for that email address, we've sent a sign-in link. Click the link in the email to sign in.
+      </p>
+
+      <div class="bg-slate-50 rounded-lg p-4 mb-6">
+        <p class="text-sm text-slate-600 text-center">
+          The link will expire in 30 minutes. If you don't see the email, check your spam folder.
+        </p>
+      </div>
+
+      <a
+        href="/login"
+        class="w-full inline-flex items-center justify-center gap-2 border border-slate-300 rounded-xl px-4 py-3 text-slate-700 font-medium hover:bg-slate-50 transition"
+      >
+        <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"/>
+        </svg>
+        Back to Sign In
+      </a>
+    </div>
+  </div>
+</body>
+</html>

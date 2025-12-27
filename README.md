@@ -1,14 +1,15 @@
-````markdown
 # secureauth
 
-A reusable Go module for **Google Sign-In + DB-backed sessions** with:
+A reusable Go module for **passwordless authentication** with:
 
-- No passwords (Google OAuth2 / OpenID Connect only)
+- **Google Sign-In** (OAuth2 / OpenID Connect)
+- **Email Magic Links** (passwordless email authentication)
+- **Automatic account linking** (same email = same account)
 - Server-side sessions (opaque tokens, **hashed in DB**)
-- Built-in DB migrations (`users`, `sessions`)
-- Login page (Tailwind + Alpine)
+- Built-in DB migrations (`users`, `sessions`, `identities`, `magic_links`)
+- Login page (Tailwind + Alpine) with both Google and Email options
 - Middleware for protecting routes
-- CSRF protection for logout
+- CSRF protection
 - Sensible security defaults
 
 Designed for Go web apps using chi, htmx, and AlpineJS.
@@ -17,148 +18,140 @@ Designed for Go web apps using chi, htmx, and AlpineJS.
 
 ## Features
 
+### Authentication Methods
+
 - **Google OAuth2 / OpenID Connect**
   - Uses `openid email profile` scopes
   - Verifies ID token signature, `aud`, `iss`, `exp`
   - Enforces `email_verified = true`
   - Uses OIDC `state` and `nonce` (CSRF + replay protection)
 
-- **Sessions**
-  - Random opaque session tokens (stored in cookie)
-  - Tokens **hashed** with SHA-256 in DB (`session_token_hash`)
-  - Sliding expiration with configurable TTL
-  - HttpOnly, SameSite=Lax cookies
-  - Optional `Secure` flag for HTTPS-only cookies
+- **Email Magic Links** (NEW)
+  - Passwordless authentication via one-time email links
+  - HMAC-SHA256 token hashing with server secret
+  - Single-use tokens with configurable expiry (default 30 min)
+  - Rate limiting per email and IP address
+  - Confirmation page to mitigate email link scanners
+  - No password storage or password reset needed
 
-- **Database**
-  - `users` table keyed by Google `sub`
-  - `sessions` table keyed by `session_token_hash`
-  - Embedded SQL migrations, applied via `Migrate`
+### Account Linking
 
-- **HTTP integration**
-  - `LoginPageHandler` – built-in login page with “Sign in with Google”
-  - `GoogleLoginHandler` – starts OAuth flow
-  - `GoogleCallbackHandler` – handles callback, creates user + session
-  - `LogoutHandler` – deletes session, clears cookies (CSRF-protected)
-  - `RequireAuth` middleware – protects routes and injects user into context
-  - `LoadUser` middleware – optional, attaches user if logged in but doesn’t enforce
+**Same email = same account.** If a user:
+1. First logs in with Google (e.g., `user@example.com`)
+2. Later uses a magic link with the same email
+
+They will be linked to the **same** internal user account automatically. This works in both directions.
+
+### Sessions
+
+- Random opaque session tokens (stored in cookie)
+- Tokens **hashed** with SHA-256 in DB (`session_token_hash`)
+- Sliding expiration with configurable TTL
+- Optional absolute maximum session lifetime
+- HttpOnly, SameSite=Lax cookies
+- Optional `Secure` flag for HTTPS-only cookies
+
+### Database
+
+- Multi-provider identity support via `identities` table
+- `users` table for core user data
+- `sessions` table keyed by `session_token_hash`
+- `magic_links` table for one-time login tokens
+- Embedded SQL migrations, applied via `Migrate`
+- Automatic migration of existing Google users to identities
 
 ---
 
 ## Install
 
-In your **app** module:
-
 ```bash
 go get github.com/ashishbishnoi18/secureauth@latest
-````
-
-(Replace `github.com/ashishbishnoi18/secureauth` with your actual module path if different.)
-
-In `go.mod` you’ll see something like:
-
-```go
-require github.com/ashishbishnoi18/secureauth v0.1.0
-```
-
-If you are developing the module locally side-by-side with an app, add a `replace`:
-
-```go
-replace github.com/ashishbishnoi18/secureauth => ../secureauth
 ```
 
 ---
 
-## Environment variables
+## Environment Variables
 
-The module expects config via environment variables. You can load a `.env` file using `github.com/joho/godotenv` in your app.
+### For Google Auth (optional if only using email)
 
-### Required
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `GOOGLE_CLIENT_ID` | Yes* | Google OAuth client ID |
+| `GOOGLE_CLIENT_SECRET` | Yes* | Google OAuth client secret |
+| `GOOGLE_REDIRECT_URL` | Yes* | e.g. `http://localhost:8080/auth/google/callback` |
 
-* `GOOGLE_CLIENT_ID`
-* `GOOGLE_CLIENT_SECRET`
-* `GOOGLE_REDIRECT_URL` – e.g. `http://localhost:8080/auth/google/callback`
+*Required if you want Google login
 
-### Recommended app config
+### For Magic Link Auth
 
-* `APP_BASE_URL` – e.g. `http://localhost:8080` or `https://yourapp.com`
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `MAGIC_LINK_ENABLED` | Yes | Set to `true` to enable email magic links |
+| `MAGIC_LINK_SECRET` | Yes | High-entropy secret for HMAC (min 32 chars) |
+| `MAGIC_LINK_TTL_MINUTES` | No | Link expiry time (default: 30) |
+| `MAGIC_LINK_RATE_LIMIT` | No | Max requests per email per hour (default: 5) |
+| `SMTP_HOST` | Yes* | SMTP server host |
+| `SMTP_PORT` | Yes* | SMTP server port (e.g., 587) |
+| `SMTP_USERNAME` | No | SMTP username |
+| `SMTP_PASSWORD` | No | SMTP password |
+| `SMTP_FROM` | Yes* | From email address |
+| `SMTP_FROM_NAME` | No | From display name |
 
-### Session config
+*Required if `MAGIC_LINK_ENABLED=true`
 
-* `SESSION_COOKIE_NAME` – default: `app_session`
-* `SESSION_COOKIE_DOMAIN` – default: empty → current host
-* `SESSION_TTL_HOURS` – default: `720` (30 days)
-* `SESSION_SECURE_COOKIES`
+### App & Session Config
 
-  * `true` in production with HTTPS
-  * `false` for localhost dev
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `APP_BASE_URL` | `http://localhost:8080` | Your app's base URL |
+| `SESSION_COOKIE_NAME` | `app_session` | Cookie name |
+| `SESSION_COOKIE_DOMAIN` | (empty) | Cookie domain |
+| `SESSION_TTL_HOURS` | `720` (30 days) | Session sliding TTL |
+| `SESSION_MAX_TTL_HOURS` | `0` (no limit) | Absolute max lifetime (set to 4380 for 6 months) |
+| `SESSION_SECURE_COOKIES` | `false` | Set `true` for HTTPS |
+| `LOGIN_PATH` | `/login` | Login page path |
+| `AFTER_LOGIN_PATH` | `/` | Redirect after login |
+| `AFTER_LOGOUT_PATH` | `/login` | Redirect after logout |
+| `TRUST_PROXY_HEADERS` | `false` | Trust X-Forwarded-For |
 
-### Auth route paths (optional overrides)
+### Validation
 
-* `LOGIN_PATH` – default: `/login`
-* `AFTER_LOGIN_PATH` – default: `/`
-* `AFTER_LOGOUT_PATH` – default: `/login`
-
-### Proxy config
-
-* `TRUST_PROXY_HEADERS` – default: `false`
-  Set to `true` only if you are behind a **trusted** reverse proxy and want to rely on `X-Forwarded-For` for client IP.
-
-### Safety check
-
-If `APP_BASE_URL` starts with `https://` and `SESSION_SECURE_COOKIES=false`, `ConfigFromEnv` will return an error.
-
-In production you **must** use secure cookies.
+- At least one auth method must be configured (Google OR Magic Link)
+- If `APP_BASE_URL` is HTTPS, `SESSION_SECURE_COOKIES` must be `true`
+- `MAGIC_LINK_SECRET` must be at least 32 characters
 
 ---
 
-## Database schema
+## Quick Start
 
-The module currently ships with a **Postgres**-oriented implementation.
+### 1. Configure Environment
 
-It provides:
+```bash
+# .env file
 
-* Embedded SQL migrations
-* A `Migrate` function that applies them
-* A `PostgresStore` that implements the `Store` interface
+# Google (optional)
+GOOGLE_CLIENT_ID=your-client-id
+GOOGLE_CLIENT_SECRET=your-client-secret
+GOOGLE_REDIRECT_URL=http://localhost:8080/auth/google/callback
 
-Tables created:
+# Magic Link
+MAGIC_LINK_ENABLED=true
+MAGIC_LINK_SECRET=your-32-char-minimum-secret-key-here
 
-```sql
--- users
-CREATE TABLE IF NOT EXISTS users (
-    id          BIGSERIAL PRIMARY KEY,
-    google_sub  TEXT NOT NULL UNIQUE,
-    email       TEXT NOT NULL,
-    name        TEXT,
-    avatar_url  TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+# SMTP
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USERNAME=your@gmail.com
+SMTP_PASSWORD=your-app-password
+SMTP_FROM=noreply@yourapp.com
+SMTP_FROM_NAME=YourApp
 
--- sessions
-CREATE TABLE IF NOT EXISTS sessions (
-    id                 BIGSERIAL PRIMARY KEY,
-    session_token_hash TEXT NOT NULL UNIQUE,
-    user_id            BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at         TIMESTAMPTZ NOT NULL,
-    last_seen_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    user_agent         TEXT,
-    ip_address         INET
-);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions (user_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions (expires_at);
+# App
+APP_BASE_URL=http://localhost:8080
+DATABASE_URL=postgres://user:pass@localhost:5432/myapp?sslmode=disable
 ```
 
-Migrations are applied transactionally via `Migrate(ctx, db)`.
-
----
-
-## Quick start: new app
-
-### 1. Load config and DB, run migrations
+### 2. Initialize and Run Migrations
 
 ```go
 package main
@@ -171,12 +164,10 @@ import (
 
     _ "github.com/lib/pq"
     "github.com/joho/godotenv"
-
     "github.com/ashishbishnoi18/secureauth"
 )
 
 func main() {
-    // Load .env for local development (optional)
     _ = godotenv.Load()
 
     cfg, err := secureauth.ConfigFromEnv()
@@ -184,31 +175,22 @@ func main() {
         log.Fatalf("config: %v", err)
     }
 
-    dsn := os.Getenv("DATABASE_URL")
-    if dsn == "" {
-        dsn = "postgres://user:pass@localhost:5432/myapp?sslmode=disable"
-    }
-
-    db, err := sql.Open("postgres", dsn)
+    db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
     if err != nil {
-        log.Fatalf("db open: %v", err)
+        log.Fatalf("db: %v", err)
     }
     defer db.Close()
 
-    if err := db.Ping(); err != nil {
-        log.Fatalf("db ping: %v", err)
-    }
-
-    // Apply auth migrations
+    // Apply migrations (creates users, sessions, identities, magic_links tables)
     if err := secureauth.Migrate(context.Background(), db); err != nil {
-        log.Fatalf("auth migrations: %v", err)
+        log.Fatalf("migrations: %v", err)
     }
 
-    // ...
+    // ... continue setup
 }
 ```
 
-### 2. Build `Store` and `Auth`
+### 3. Set Up Auth Handlers
 
 ```go
 store := secureauth.NewPostgresStore(db)
@@ -217,9 +199,17 @@ auth, err := secureauth.New(context.Background(), cfg, store)
 if err != nil {
     log.Fatalf("auth init: %v", err)
 }
+
+// Set up magic link auth if enabled
+if cfg.EnableMagicLink {
+    smtpCfg := cfg.SMTPConfigFromConfig()
+    emailSender := secureauth.NewSMTPEmailSender(smtpCfg, cfg.AppBaseURL)
+    magicLink := secureauth.NewMagicLinkAuth(cfg, store, emailSender)
+    auth.SetMagicLinkAuth(magicLink)
+}
 ```
 
-### 3. Wire routes (example with `chi`)
+### 4. Wire Routes (chi example)
 
 ```go
 import (
@@ -228,172 +218,302 @@ import (
 )
 
 func main() {
-    // ... config, db, migrations, store, auth
+    // ... setup code from above
 
     r := chi.NewRouter()
 
-    // Public routes
+    // Login page (shows both Google and Email options)
     r.Get(cfg.LoginPath, auth.LoginPageHandler)
-    r.Get("/auth/google/login", auth.GoogleLoginHandler)
-    r.Get("/auth/google/callback", auth.GoogleCallbackHandler)
 
-    // Logout (POST)
+    // Google auth routes
+    if auth.GoogleEnabled() {
+        r.Get("/auth/google/login", auth.GoogleLoginHandler)
+        r.Get("/auth/google/callback", auth.GoogleCallbackHandler)
+    }
+
+    // Magic link routes
+    if auth.MagicLinkEnabled() {
+        magicLink := auth.MagicLink()
+        r.Post("/auth/email/start", magicLink.EmailStartHandler)
+        r.Get("/auth/email/verify", magicLink.EmailVerifyHandler)
+        r.Post("/auth/email/consume", magicLink.EmailConsumeHandler(auth))
+
+        // "Forgot password" just sends a magic link (no passwords in this system)
+        r.Post("/forgot-password", magicLink.ForgotPasswordHandler)
+    }
+
+    // Logout (requires CSRF token)
     r.Post("/auth/logout", auth.LogoutHandler)
 
-    // Protected group
+    // Protected routes
     r.Group(func(pr chi.Router) {
         pr.Use(auth.RequireAuth)
-
-        pr.Get("/", func(w http.ResponseWriter, r *http.Request) {
-            user := secureauth.CurrentUser(r)
-            w.Write([]byte("Hello, " + user.Email))
-        })
+        pr.Get("/", dashboardHandler)
+        pr.Get("/profile", profileHandler)
     })
 
     log.Fatal(http.ListenAndServe(":8080", r))
 }
-```
 
-At this point:
-
-* `/login` renders the built-in login page
-* Clicking “Continue with Google” starts the OAuth flow
-* After successful login:
-
-  * A `users` row and a `sessions` row are created
-  * A secure session cookie is set
-  * The user is redirected to `/`
-* `/` is protected by `RequireAuth`
-
----
-
-## Using the current user in handlers
-
-Inside any handler that runs after `RequireAuth`:
-
-```go
 func dashboardHandler(w http.ResponseWriter, r *http.Request) {
     user := secureauth.CurrentUser(r)
-    if user == nil {
-        // Should not happen if RequireAuth is used, but be defensive
-        http.Redirect(w, r, "/login", http.StatusSeeOther)
-        return
-    }
-
-    fmt.Fprintf(w, "Welcome, %s (%s)", user.Name, user.Email)
+    w.Write([]byte("Hello, " + user.Email))
 }
 ```
 
-`RequireAuth` does the heavy lifting:
+---
 
-* Reads the session cookie
-* Validates and possibly extends the session
-* Loads the `User` from the DB
-* Attaches `*User` to the request context
+## Account Linking Behavior
 
-If you just want to *optionally* attach the user without enforcing login, use:
+The system automatically links accounts by verified email:
+
+### Scenario 1: Google First, Then Magic Link
+
+1. User signs in with Google (`user@example.com`)
+2. User record created with Google identity
+3. Later, user requests magic link for `user@example.com`
+4. Magic link redeemed → finds existing user by email
+5. Email identity added to same user account
+6. Same `user_id` across both login methods
+
+### Scenario 2: Magic Link First, Then Google
+
+1. User signs in via magic link (`user@example.com`)
+2. User record created with email identity
+3. Later, user signs in with Google (same email)
+4. Google login finds existing user by email
+5. Google identity added to same user account
+6. Same `user_id` across both login methods
+
+### Edge Cases
+
+- **Ambiguous emails**: If somehow multiple users have the same verified email (shouldn't happen with proper linking), login fails safely with an error log
+- **Email normalization**: All emails are lowercased and trimmed before storage/comparison
+
+---
+
+## Forgot Password
+
+In a passwordless system, "forgot password" simply sends a magic link. The `ForgotPasswordHandler` is an alias for `EmailStartHandler`:
 
 ```go
-r.With(auth.LoadUser).Get("/some-route", handler)
+r.Post("/forgot-password", magicLink.ForgotPasswordHandler)
 ```
 
-and call `secureauth.CurrentUser(r)` inside that handler.
+No password storage or reset functionality is implemented—users always sign in via Google or magic link.
 
 ---
 
-## Logout + CSRF
+## Security Features
 
-`LogoutHandler`:
+### Token Security
 
-* Requires a CSRF token (double-submit cookie pattern)
-* Deletes the session row from DB by token
-* Clears the session cookie and CSRF cookie
-* Redirects to `AFTER_LOGOUT_PATH` (default `/login`)
+- **Session tokens**: 64 bytes of random data, SHA-256 hashed in DB
+- **Magic link tokens**: 32 bytes of random data, HMAC-SHA256 hashed with server secret
+- **Constant-time comparison** for all token validation
 
-On login, the module sets a non-HttpOnly CSRF cookie:
+### Rate Limiting
 
-* Name: `SESSION_COOKIE_NAME + "_csrf"`
-  e.g. if `SESSION_COOKIE_NAME=myapp_session`, cookie is `myapp_session_csrf`
-* Value: random token
+Magic link requests are rate limited:
+- Per email: configurable (default 5/hour)
+- Per IP: 30/minute
 
-Your logout form should read this cookie and send it back as `csrf_token` (form field) or `X-CSRF-Token` header.
+For distributed deployments, implement a Redis-based rate limiter.
 
-### Simple logout form example
+### Link Scanner Mitigation
 
-```html
-<form method="post" action="/auth/logout">
-  <input type="hidden" name="csrf_token" id="logoutCsrf">
-  <button type="submit">Logout</button>
-</form>
+Magic link verification uses a two-step process:
+1. `GET /auth/email/verify?token=...` → Shows confirmation page
+2. `POST /auth/email/consume` with token → Actually consumes the token
 
-<script>
-  function getCookie(name) {
-    const m = document.cookie.match('(^|;)\\s*' + name + '\\s*=\\s*([^;]+)');
-    return m ? m.pop() : '';
-  }
+This prevents email security scanners from accidentally consuming tokens.
 
-  document.addEventListener('DOMContentLoaded', function () {
-    var cookieName = "myapp_session_csrf"; // SESSION_COOKIE_NAME + "_csrf"
-    var token = getCookie(cookieName);
-    var field = document.getElementById('logoutCsrf');
-    if (field && token) {
-      field.value = token;
-    }
-  });
-</script>
-```
+### Enumeration Prevention
 
-With htmx, you can also send the token via headers; the handler accepts both form field and header.
+The magic link start endpoint always returns the same response (200 OK with "check your email" page) regardless of whether the email exists. This prevents user enumeration attacks.
+
+### Cookies
+
+- `HttpOnly` for session cookie (not readable by JavaScript)
+- `SameSite=Lax` to prevent CSRF in most cases
+- `Secure` flag when using HTTPS
+- CSRF token in separate non-HttpOnly cookie for logout protection
 
 ---
 
-## Security notes
+## Database Schema
 
-* **Session tokens hashed in DB**
-  Cookies carry the opaque random token; DB stores `SHA-256(token)` (base64).
-  This reduces the impact if your DB is ever leaked.
+After running migrations, you'll have:
 
-* **HTTPS in production**
-  When `APP_BASE_URL` uses `https://`, you must set `SESSION_SECURE_COOKIES=true`.
-  If not, `ConfigFromEnv` will fail.
+```sql
+-- users (core user data)
+CREATE TABLE users (
+    id          BIGSERIAL PRIMARY KEY,
+    google_sub  TEXT,              -- Legacy, nullable (for backward compat)
+    email       TEXT NOT NULL,
+    name        TEXT,
+    avatar_url  TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-* **Trusting proxies**
-  Only set `TRUST_PROXY_HEADERS=true` when you are behind a trusted reverse proxy (e.g. Nginx, HAProxy, Cloudflare) that sets `X-Forwarded-For`.
-  Otherwise, client IP is taken from `RemoteAddr`.
+-- identities (multi-provider support)
+CREATE TABLE identities (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider        TEXT NOT NULL,           -- 'google' or 'email'
+    provider_subject TEXT NOT NULL,          -- google 'sub' or email address
+    email           TEXT NOT NULL,
+    email_verified  BOOLEAN NOT NULL DEFAULT false,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (provider, provider_subject)
+);
 
-* **Email domain restrictions (optional)**
-  If you want to allow only certain domains (e.g. `@yourcompany.com`), you can fork the module and add a check in `GoogleCallbackHandler` after reading `claims.Email`.
+-- sessions
+CREATE TABLE sessions (
+    id                 BIGSERIAL PRIMARY KEY,
+    session_token_hash TEXT NOT NULL UNIQUE,
+    user_id            BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at         TIMESTAMPTZ NOT NULL,
+    last_seen_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    user_agent         TEXT,
+    ip_address         INET
+);
+
+-- magic_links
+CREATE TABLE magic_links (
+    id                  BIGSERIAL PRIMARY KEY,
+    email               TEXT NOT NULL,
+    token_hash          TEXT NOT NULL UNIQUE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at          TIMESTAMPTZ NOT NULL,
+    used_at             TIMESTAMPTZ,
+    request_ip          TEXT,
+    request_user_agent  TEXT,
+    consumed_ip         TEXT,
+    consumed_user_agent TEXT
+);
+```
+
+The migration automatically converts existing Google users to have identity records.
 
 ---
 
-## Typical flow in a new project
+## Session Duration (6 Months)
 
-1. Add the module:
+For long-lived sessions (e.g., 6 months), configure:
 
-   ```bash
-   go get github.com/ashishbishnoi18/secureauth@latest
-   ```
+```bash
+SESSION_TTL_HOURS=720           # Sliding window: 30 days
+SESSION_MAX_TTL_HOURS=4380      # Absolute max: ~6 months
+```
 
-2. Create `.env` with:
-
-   * Google client ID, secret, redirect URL
-   * Session settings
-   * APP_BASE_URL
-
-3. In `main.go`:
-
-   * Load `.env`
-   * Call `ConfigFromEnv()`
-   * Open DB and run `secureauth.Migrate`
-   * Create `PostgresStore` and `Auth`
-   * Wire handlers and middleware as shown above
-
-4. Implement templates and handlers that read the current user via `secureauth.CurrentUser(r)`.
-
-From then on, every new project uses the **same** auth behavior by just repeating this wiring; you never reimplement login, sessions, or Google OAuth per project.
+Behavior:
+- Session extends by `SESSION_TTL_HOURS` on activity (sliding)
+- Session never exceeds `SESSION_MAX_TTL_HOURS` from creation (absolute cap)
+- Set `SESSION_MAX_TTL_HOURS=0` for no absolute limit
 
 ---
 
+## Custom Email Sender
+
+Implement the `EmailSender` interface for custom email providers:
+
+```go
+type EmailSender interface {
+    SendMagicLink(ctx context.Context, to, link string, expiresInMinutes int) error
+}
 ```
-::contentReference[oaicite:0]{index=0}
+
+Example with a third-party service:
+
+```go
+type SendGridSender struct {
+    apiKey string
+}
+
+func (s *SendGridSender) SendMagicLink(ctx context.Context, to, link string, expiresInMinutes int) error {
+    // Implement SendGrid API call
+    return nil
+}
+
+// Use it:
+emailSender := &SendGridSender{apiKey: os.Getenv("SENDGRID_API_KEY")}
+magicLink := secureauth.NewMagicLinkAuth(cfg, store, emailSender)
 ```
+
+For development, use the logging sender:
+
+```go
+emailSender := secureauth.NewLoggingEmailSender(log.Printf)
+```
+
+This prints magic links to the console instead of sending emails.
+
+---
+
+## Operational Considerations
+
+### Email Deliverability
+
+- Use a reputable SMTP provider (SendGrid, Mailgun, AWS SES)
+- Configure SPF, DKIM, and DMARC for your sending domain
+- Monitor bounce rates and spam complaints
+
+### Rate Limiting in Production
+
+The built-in rate limiter is in-memory. For multi-instance deployments:
+- Implement a Redis-based rate limiter
+- Or use an API gateway with rate limiting
+
+### Reverse Proxy Headers
+
+If behind a load balancer, set:
+```bash
+TRUST_PROXY_HEADERS=true
+```
+
+Ensure your proxy correctly sets `X-Forwarded-For`.
+
+### Cleanup
+
+Periodically clean up expired magic links:
+```go
+store.DeleteExpiredMagicLinks(context.Background())
+```
+
+Consider running this in a background goroutine or cron job.
+
+---
+
+## Testing
+
+Run tests:
+
+```bash
+go test -v ./...
+```
+
+The test suite covers:
+- Token generation and HMAC hashing
+- Token expiry and single-use enforcement
+- Account linking (Google → Magic Link)
+- Enumeration prevention
+- Rate limiting
+- Email validation
+
+---
+
+## Migration from Google-Only
+
+Existing apps using Google-only auth can add magic link support:
+
+1. Update the module
+2. Run migrations (adds `identities` and `magic_links` tables)
+3. Existing Google users automatically get identity records
+4. Add magic link routes and configuration
+5. Existing sessions continue to work
+
+No data loss or breaking changes for existing users.

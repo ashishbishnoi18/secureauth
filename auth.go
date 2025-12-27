@@ -5,8 +5,10 @@ import (
     "crypto/rand"
     _ "embed"
     "encoding/base64"
+    "encoding/hex"
     "errors"
     "fmt"
+    "log"
     "net"
     "net/http"
     "strings"
@@ -16,6 +18,15 @@ import (
     "golang.org/x/oauth2"
     "golang.org/x/oauth2/google"
 )
+
+// generateCorrelationID generates a short correlation ID for error tracing.
+func generateCorrelationID() string {
+    b := make([]byte, 8)
+    if _, err := rand.Read(b); err != nil {
+        return "unknown"
+    }
+    return hex.EncodeToString(b)
+}
 
 //go:embed templates/login.html
 var loginPageHTML string
@@ -29,47 +40,73 @@ type Auth struct {
     stateCookieName string
     nonceCookieName string
     csrfCookieName  string
+
+    // Magic link auth (optional)
+    magicLink *MagicLinkAuth
 }
 
 // New initializes the Auth instance. Use context.Background() in your main().
+// Google OAuth is optional if magic link auth is enabled.
 func New(ctx context.Context, cfg Config, store Store) (*Auth, error) {
     if store == nil {
         return nil, errors.New("store is required")
     }
 
-    // Discover Google OIDC endpoints
-    provider, err := oidc.NewProvider(ctx, "https://accounts.google.com")
-    if err != nil {
-        return nil, fmt.Errorf("oidc provider: %w", err)
-    }
-
-    oauthCfg := &oauth2.Config{
-        ClientID:     cfg.GoogleClientID,
-        ClientSecret: cfg.GoogleClientSecret,
-        RedirectURL:  cfg.RedirectURL,
-        Endpoint:     google.Endpoint,
-        Scopes: []string{
-            oidc.ScopeOpenID,
-            "profile",
-            "email",
-        },
-    }
-
-    verifier := provider.Verifier(&oidc.Config{
-        ClientID: cfg.GoogleClientID,
-    })
-
     a := &Auth{
         cfg:             cfg,
         store:           store,
-        oauthConfig:     oauthCfg,
-        idTokenVerifier: verifier,
         stateCookieName: cfg.CookieName + "_oauth_state",
         nonceCookieName: cfg.CookieName + "_oauth_nonce",
         csrfCookieName:  cfg.CookieName + "_csrf",
     }
 
+    // Initialize Google OAuth if configured
+    if cfg.GoogleConfigured() {
+        provider, err := oidc.NewProvider(ctx, "https://accounts.google.com")
+        if err != nil {
+            return nil, fmt.Errorf("oidc provider: %w", err)
+        }
+
+        a.oauthConfig = &oauth2.Config{
+            ClientID:     cfg.GoogleClientID,
+            ClientSecret: cfg.GoogleClientSecret,
+            RedirectURL:  cfg.RedirectURL,
+            Endpoint:     google.Endpoint,
+            Scopes: []string{
+                oidc.ScopeOpenID,
+                "profile",
+                "email",
+            },
+        }
+
+        a.idTokenVerifier = provider.Verifier(&oidc.Config{
+            ClientID: cfg.GoogleClientID,
+        })
+    }
+
     return a, nil
+}
+
+// SetMagicLinkAuth sets the magic link authenticator.
+// Call this after New() if you want to enable magic link auth.
+func (a *Auth) SetMagicLinkAuth(m *MagicLinkAuth) {
+    a.magicLink = m
+}
+
+// MagicLinkEnabled returns true if magic link auth is configured.
+func (a *Auth) MagicLinkEnabled() bool {
+    return a.magicLink != nil
+}
+
+// MagicLink returns the magic link authenticator.
+// Returns nil if magic link auth is not configured.
+func (a *Auth) MagicLink() *MagicLinkAuth {
+    return a.magicLink
+}
+
+// GoogleEnabled returns true if Google OAuth is configured.
+func (a *Auth) GoogleEnabled() bool {
+    return a.oauthConfig != nil
 }
 
 // LoginPageHandler serves the embedded login page.
@@ -86,6 +123,11 @@ func (a *Auth) LoginPageHandler(w http.ResponseWriter, r *http.Request) {
 
 // GoogleLoginHandler starts the OAuth2 flow.
 func (a *Auth) GoogleLoginHandler(w http.ResponseWriter, r *http.Request) {
+    if !a.GoogleEnabled() {
+        http.Error(w, "Google login not configured", http.StatusNotFound)
+        return
+    }
+
     state, err := randomString(32)
     if err != nil {
         http.Error(w, "failed to start login", http.StatusInternalServerError)
@@ -130,6 +172,11 @@ func (a *Auth) GoogleLoginHandler(w http.ResponseWriter, r *http.Request) {
 
 // GoogleCallbackHandler handles Google's redirect back with ?code & ?state.
 func (a *Auth) GoogleCallbackHandler(w http.ResponseWriter, r *http.Request) {
+    if !a.GoogleEnabled() {
+        http.Error(w, "Google login not configured", http.StatusNotFound)
+        return
+    }
+
     ctx := r.Context()
 
     state := r.URL.Query().Get("state")
@@ -218,55 +265,187 @@ func (a *Auth) GoogleCallbackHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Upsert user
-    u, err := a.store.GetUserByGoogleSub(ctx, claims.Sub)
+    // Normalize email
+    normalizedEmail := strings.TrimSpace(strings.ToLower(claims.Email))
+
+    // Find or create user via identity
+    user, err := a.findOrCreateUserByGoogleIdentity(ctx, claims.Sub, normalizedEmail, claims.Name, claims.Picture)
     if err != nil {
-        http.Error(w, "db error", http.StatusInternalServerError)
+        log.Printf("[GOOGLE_AUTH] Failed to find/create user: %v", err)
+        http.Error(w, "failed to process login", http.StatusInternalServerError)
         return
     }
 
-    now := time.Now()
-    if u == nil {
-        u = &User{
-            GoogleSub: claims.Sub,
-            Email:     claims.Email,
-            Name:      claims.Name,
-            AvatarURL: claims.Picture,
-        }
-        if err := a.store.CreateUser(ctx, u); err != nil {
-            http.Error(w, "failed to create user", http.StatusInternalServerError)
-            return
-        }
-    } else {
-        // Keep email/profile up to date
-        u.Email = claims.Email
-        u.Name = claims.Name
-        u.AvatarURL = claims.Picture
-        if err := a.store.UpdateUser(ctx, u); err != nil {
-            http.Error(w, "failed to update user", http.StatusInternalServerError)
-            return
-        }
-    }
-
     // Create session
-    sessToken, err := randomString(64)
-    if err != nil {
+    if err := a.createSessionForUser(w, r, user); err != nil {
+        log.Printf("[GOOGLE_AUTH] Failed to create session: %v", err)
         http.Error(w, "failed to create session", http.StatusInternalServerError)
         return
     }
 
+    log.Printf("[GOOGLE_AUTH] User logged in: user_id=%d email=%s", user.ID, user.Email)
+
+    http.Redirect(w, r, a.cfg.AfterLoginPath, http.StatusSeeOther)
+}
+
+// findOrCreateUserByGoogleIdentity handles the Google login flow with identity linking.
+// If the user already exists (by google sub or email), it links/updates the identity.
+// If not, it creates a new user and identity.
+func (a *Auth) findOrCreateUserByGoogleIdentity(ctx context.Context, googleSub, email, name, picture string) (*User, error) {
+    // First check if we have an identity for this Google sub
+    identity, err := a.store.GetIdentityByProviderSubject(ctx, "google", googleSub)
+    if err != nil {
+        return nil, fmt.Errorf("get identity: %w", err)
+    }
+
+    if identity != nil {
+        // Existing Google identity - get the user
+        user, err := a.store.GetUserByID(ctx, identity.UserID)
+        if err != nil {
+            return nil, fmt.Errorf("get user: %w", err)
+        }
+        if user == nil {
+            return nil, fmt.Errorf("user not found for identity")
+        }
+
+        // Update user info if changed
+        if user.Email != email || user.Name != name || user.AvatarURL != picture {
+            user.Email = email
+            user.Name = name
+            user.AvatarURL = picture
+            if err := a.store.UpdateUser(ctx, user); err != nil {
+                log.Printf("[GOOGLE_AUTH] Warning: failed to update user: %v", err)
+            }
+        }
+
+        // Update identity email if changed
+        if identity.Email != email {
+            identity.Email = email
+            if err := a.store.UpdateIdentity(ctx, identity); err != nil {
+                log.Printf("[GOOGLE_AUTH] Warning: failed to update identity: %v", err)
+            }
+        }
+
+        return user, nil
+    }
+
+    // No Google identity found - check if there's an existing user with this email
+    existingIdentities, err := a.store.GetIdentitiesByEmail(ctx, email)
+    if err != nil {
+        return nil, fmt.Errorf("get identities by email: %w", err)
+    }
+
+    var user *User
+    if len(existingIdentities) > 0 {
+        // Link to existing user
+        userID := existingIdentities[0].UserID
+        // Verify all identities point to same user
+        for _, id := range existingIdentities[1:] {
+            if id.UserID != userID {
+                return nil, fmt.Errorf("ambiguous email: multiple users have verified email %s", email)
+            }
+        }
+
+        user, err = a.store.GetUserByID(ctx, userID)
+        if err != nil {
+            return nil, fmt.Errorf("get user by id: %w", err)
+        }
+        if user == nil {
+            return nil, fmt.Errorf("user not found")
+        }
+
+        // Update user info
+        user.Email = email
+        user.Name = name
+        user.AvatarURL = picture
+        user.GoogleSub = googleSub // For backward compatibility
+        if err := a.store.UpdateUser(ctx, user); err != nil {
+            log.Printf("[GOOGLE_AUTH] Warning: failed to update user: %v", err)
+        }
+
+        log.Printf("[GOOGLE_AUTH] Linking Google identity to existing user: user_id=%d email=%s", user.ID, email)
+    } else {
+        // Check for legacy user by google_sub (for backward compatibility with existing users)
+        user, err = a.store.GetUserByGoogleSub(ctx, googleSub)
+        if err != nil {
+            return nil, fmt.Errorf("get user by google sub: %w", err)
+        }
+
+        if user != nil {
+            // Legacy user exists - update and continue
+            user.Email = email
+            user.Name = name
+            user.AvatarURL = picture
+            if err := a.store.UpdateUser(ctx, user); err != nil {
+                log.Printf("[GOOGLE_AUTH] Warning: failed to update user: %v", err)
+            }
+        } else {
+            // Create new user
+            user = &User{
+                GoogleSub: googleSub,
+                Email:     email,
+                Name:      name,
+                AvatarURL: picture,
+            }
+            if err := a.store.CreateUser(ctx, user); err != nil {
+                return nil, fmt.Errorf("create user: %w", err)
+            }
+            log.Printf("[GOOGLE_AUTH] Created new user: user_id=%d email=%s", user.ID, email)
+        }
+    }
+
+    // Create the Google identity
+    googleIdentity := &Identity{
+        UserID:          user.ID,
+        Provider:        "google",
+        ProviderSubject: googleSub,
+        Email:           email,
+        EmailVerified:   true,
+    }
+    if err := a.store.CreateIdentity(ctx, googleIdentity); err != nil {
+        if errors.Is(err, ErrDuplicateVerifiedEmail) {
+            // Security: another user already has this verified email.
+            // This should not happen with proper linking, but fail closed.
+            corrID := generateCorrelationID()
+            log.Printf("[GOOGLE_AUTH] SECURITY: duplicate verified email on identity create, corr_id=%s user_id=%d", corrID, user.ID)
+            return nil, fmt.Errorf("account conflict [ref: %s]", corrID)
+        }
+        log.Printf("[GOOGLE_AUTH] Warning: failed to create google identity: %v", err)
+        // Continue anyway - the user is created/updated
+    }
+
+    return user, nil
+}
+
+// createSessionForUser creates a session for the given user and sets cookies.
+func (a *Auth) createSessionForUser(w http.ResponseWriter, r *http.Request, user *User) error {
+    sessToken, err := randomString(64)
+    if err != nil {
+        return fmt.Errorf("generate session token: %w", err)
+    }
+
+    now := time.Now()
+    expiresAt := now.Add(a.cfg.SessionTTL)
+
+    // Apply absolute max TTL if configured
+    if a.cfg.SessionMaxTTL > 0 {
+        maxExpiry := now.Add(a.cfg.SessionMaxTTL)
+        if expiresAt.After(maxExpiry) {
+            expiresAt = maxExpiry
+        }
+    }
+
     sess := &Session{
         SessionToken: sessToken,
-        UserID:       u.ID,
-        ExpiresAt:    now.Add(a.cfg.SessionTTL),
+        UserID:       user.ID,
+        ExpiresAt:    expiresAt,
         LastSeenAt:   now,
         UserAgent:    r.UserAgent(),
         IPAddress:    a.clientIP(r),
     }
 
-    if err := a.store.CreateSession(ctx, sess); err != nil {
-        http.Error(w, "failed to save session", http.StatusInternalServerError)
-        return
+    if err := a.store.CreateSession(r.Context(), sess); err != nil {
+        return fmt.Errorf("create session: %w", err)
     }
 
     // Set session cookie
@@ -294,7 +473,7 @@ func (a *Auth) GoogleCallbackHandler(w http.ResponseWriter, r *http.Request) {
         })
     }
 
-    http.Redirect(w, r, a.cfg.AfterLoginPath, http.StatusSeeOther)
+    return nil
 }
 
 // LogoutHandler deletes the session from DB and clears the cookies.
@@ -408,17 +587,29 @@ func (a *Auth) currentUserFromSession(w http.ResponseWriter, r *http.Request) *U
     remaining := sess.ExpiresAt.Sub(now)
     if remaining < a.cfg.SessionTTL/2 {
         newExpiry := now.Add(a.cfg.SessionTTL)
-        _ = a.store.TouchSession(ctx, sess.ID, newExpiry)
-        // refresh cookie
-        http.SetCookie(w, &http.Cookie{
-            Name:     a.cfg.CookieName,
-            Value:    cookie.Value,
-            Path:     "/",
-            HttpOnly: true,
-            Secure:   a.cfg.SecureCookies,
-            SameSite: http.SameSiteLaxMode,
-            Expires:  newExpiry,
-        })
+
+        // Apply absolute max TTL if configured
+        if a.cfg.SessionMaxTTL > 0 {
+            maxExpiry := sess.CreatedAt.Add(a.cfg.SessionMaxTTL)
+            if newExpiry.After(maxExpiry) {
+                newExpiry = maxExpiry
+            }
+        }
+
+        // Only extend if the new expiry is actually later
+        if newExpiry.After(sess.ExpiresAt) {
+            _ = a.store.TouchSession(ctx, sess.ID, newExpiry)
+            // refresh cookie
+            http.SetCookie(w, &http.Cookie{
+                Name:     a.cfg.CookieName,
+                Value:    cookie.Value,
+                Path:     "/",
+                HttpOnly: true,
+                Secure:   a.cfg.SecureCookies,
+                SameSite: http.SameSiteLaxMode,
+                Expires:  newExpiry,
+            })
+        }
     }
 
     return user
